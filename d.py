@@ -1,3 +1,10 @@
+import torch
+import torchvision
+from torch.utils.data import DataLoader
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import matplotlib.pyplot as plt
 import os
 import sys
 import tempfile
@@ -7,43 +14,11 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
-import torch
-import torchvision
-from torch.utils.data import DataLoader
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import matplotlib.pyplot as plt
- 
+
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# On Windows platform, the torch.distributed package only
-# supports Gloo backend, FileStore and TcpStore.
-# For FileStore, set init_method parameter in init_process_group
-# to a local file. Example as follow:
-# init_method="file:///f:/libtmp/some_file"
-# dist.init_process_group(
-#    "gloo",
-#    rank=rank,
-#    init_method=init_method,
-#    world_size=world_size)
-# For TcpStore, same way as on Linux.
-
-
-
-
-def setup(rank, world_size):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-
-    # initialize the process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    
-def cleanup():
-    dist.destroy_process_group()
-
-n_epochs = 1
+n_epochs = 3
 batch_size_train = 64
 batch_size_test = 1000
 learning_rate = 0.01
@@ -51,7 +26,8 @@ momentum = 0.5
 log_interval = 10
 random_seed = 1
 torch.manual_seed(random_seed)
- 
+rank=0
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
 train_loader = torch.utils.data.DataLoader(
     torchvision.datasets.MNIST('./data/', train=True, download=True,
                                transform=torchvision.transforms.Compose([
@@ -73,7 +49,25 @@ examples = enumerate(test_loader)
 batch_idx, (example_data, example_targets) = next(examples)
 # print(example_targets)
 # print(example_data.shape)
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
 
+    # initialize the process group
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    
+def cleanup():
+    dist.destroy_process_group()
+fig = plt.figure()
+for i in range(6):
+    plt.subplot(2, 3, i + 1)
+    plt.tight_layout()
+    plt.imshow(example_data[i][0], cmap='gray', interpolation='none')
+    plt.title("Ground Truth: {}".format(example_targets[i]))
+    plt.xticks([])
+    plt.yticks([])
+plt.show()
+ 
  
 class Net(nn.Module):
     def __init__(self):
@@ -92,24 +86,19 @@ class Net(nn.Module):
         x = F.dropout(x, training=self.training)
         x = self.fc2(x)
         return F.log_softmax(x, dim=1)
-
-
-
-
-def demo_basic(rank, world_size):
-    print(f"Running basic DDP example on rank {rank}.")
-    epoch=3
-    setup(rank, world_size)
-    model = Net().to(rank)
-    network= DDP(model, device_ids=[rank])
-    optimizer = optim.SGD(network.parameters(), lr=learning_rate, momentum=momentum)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
-    train_losses = []
-    train_counter = []
-    test_losses = []
-    test_counter = [i * len(train_loader.dataset) for i in range(n_epochs + 1)]
-
-    # create model and move it to GPU with id rank
+setup(rank,1)
+model = Net().to(rank)
+network= DDP(model, device_ids=[rank])
+optimizer = optim.SGD(network.parameters(), lr=learning_rate, momentum=momentum)
+train_losses = []
+train_counter = []
+test_losses = []
+test_counter = [i * len(train_loader.dataset) for i in range(n_epochs + 1)]
+ 
+ 
+def train(epoch):
+    
+    network.train()
     for batch_idx, (data, target) in enumerate(train_loader):
         optimizer.zero_grad()
         output = network(data)
@@ -126,7 +115,7 @@ def demo_basic(rank, world_size):
             torch.save(network.state_dict(), './model.pth')
             torch.save(optimizer.state_dict(), './optimizer.pth')
     
-
+def test():
     network.eval()
     test_loss = 0
     correct = 0
@@ -135,65 +124,38 @@ def demo_basic(rank, world_size):
             output = network(data)
             test_loss += F.nll_loss(output, target.to(device), reduction='sum').item()
             pred = output.data.max(1, keepdim=True)[1]
-            correct += pred.eq(target.data.view_as(pred.to(device)).to(device)).sum()
+            correct += pred.eq(target.data.view_as(pred).to(device)).sum()
     test_loss /= len(test_loader.dataset)
     test_losses.append(test_loss)
     print('\nTest set: Avg. loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
-    
-    
-    network.eval()
-    test_loss = 0
-    correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            output = network(data)
-            test_loss += F.nll_loss(output, target.to(device), reduction='sum').item()
-            pred = output.data.max(1, keepdim=True)[1]
-            correct += pred.eq(target.data.view_as(pred.to(device)).to(device)).sum()
-    test_loss /= len(test_loader.dataset)
-    test_losses.append(test_loss)
-    print('\nTest set: Avg. loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
-
-
-
-    fig = plt.figure()
-    plt.plot(train_counter, train_losses, color='blue')
-    plt.scatter(test_counter, test_losses, color='red')
-    plt.legend(['Train Loss', 'Test Loss'], loc='upper right')
-    plt.xlabel('number of training examples seen')
-    plt.ylabel('negative log likelihood loss')
-    
-    
-    examples = enumerate(test_loader)
-    batch_idx, (example_data, example_targets) = next(examples)
-    with torch.no_grad():
-        output = network(example_data)
-    fig = plt.figure()
-    for i in range(6):
-        plt.subplot(2, 3, i + 1)
-        plt.tight_layout()
-        plt.imshow(example_data[i][0], cmap='gray', interpolation='none')
-        plt.title("Prediction: {}".format(output.data.max(1, keepdim=True)[1][i].item()))
-        plt.xticks([])
-        plt.yticks([])
-    plt.show()
-    
-    
-
-    cleanup()
-
-def run_demo(demo_fn, world_size):
-    mp.spawn(demo_fn,
-             args=(world_size,),
-             nprocs=world_size,
-             join=True)
-
-if __name__ == "__main__":
-    n_gpus = torch.cuda.device_count()
-    #assert n_gpus >= 2, f"Requires at least 2 GPUs to run, but got {n_gpus}"
-    world_size = n_gpus
-    run_demo(demo_basic, world_size)
+ 
+ 
+train(1)
+ 
+test()  # 不加这个，后面画图就会报错：x and y must be the same s ize
+for epoch in range(1, n_epochs + 1):
+    train(epoch)
+    test()
+cleanup()
+fig = plt.figure()
+plt.plot(train_counter, train_losses, color='yellow')
+plt.legend(['Train Loss', 'Test Loss'], loc='upper right')
+plt.xlabel('number of training examples seen')
+plt.ylabel('negative log likelihood loss')
+ 
+ 
+examples = enumerate(test_loader)
+batch_idx, (example_data, example_targets) = next(examples)
+with torch.no_grad():
+    output = network(example_data)
+fig = plt.figure()
+for i in range(6):
+    plt.subplot(2, 3, i + 1)
+    plt.tight_layout()
+    plt.imshow(example_data[i][0], cmap='gray', interpolation='none')
+    plt.title("Prediction: {}".format(output.data.max(1, keepdim=True)[1][i].item()))
+    plt.xticks([])
+    plt.yticks([])
+plt.show()
